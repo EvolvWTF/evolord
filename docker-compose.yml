@@ -1,0 +1,40 @@
+services:
+  evolord-server:
+    image: ${DOCKER_IMAGE:-ghcr.io/EvolvWTF/evolord:latest}
+    container_name: evolord-server
+    ports:
+      - "${PORT:-5173}:5173"
+    environment:
+      PORT: ${PORT:-5173}
+      HOST: ${HOST:-0.0.0.0}
+      # Initial admin account (you'll be forced to change password on first login)
+      EVOLORD_USER: ${EVOLORD_USER:-admin}
+      EVOLORD_PASS: ${EVOLORD_PASS:-admin}
+      # JWT secret will be auto-generated if not set
+      JWT_SECRET: ${JWT_SECRET:-}
+      NODE_ENV: ${NODE_ENV:-production}
+      EVOLORD_TLS_CERT: ${EVOLORD_TLS_CERT:-/app/certs/server.crt}
+      EVOLORD_TLS_KEY: ${EVOLORD_TLS_KEY:-/app/certs/server.key}
+      EVOLORD_TLS_CA: ${EVOLORD_TLS_CA:-}
+    volumes:
+      - evolord-data:/app/data
+      - evolord-certs:/app/certs
+      # Uncomment to use a static config file instead of env vars
+      # - ./Evolord-Server/config.json:/app/config.json:ro
+    restart: unless-stopped
+    networks:
+      - evolord-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-k", "https://localhost:5173/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  evolord-network:
+    driver: bridge
+
+volumes:
+  evolord-data:
+  evolord-certs:

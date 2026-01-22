@@ -1,0 +1,40 @@
+services:
+  evolord-server:
+    image: ghcr.io/pulsarv2/evolord:latest
+    container_name: evolord-server
+    ports:
+      - "5173:5173"
+    environment:
+      # Change these before deploying
+      - EVOLORD_USER=admin
+      - EVOLORD_PASS=ChangeMe123!
+      - JWT_SECRET=please-change-me-32-characters
+      # Server settings
+      - PORT=5173
+      - HOST=0.0.0.0
+      # TLS paths (self-signed is auto-generated if not present)
+      - EVOLORD_TLS_CERT=/app/certs/server.crt
+      - EVOLORD_TLS_KEY=/app/certs/server.key
+      - EVOLORD_TLS_CA=
+    volumes:
+      - evolord-data:/app/data
+      - evolord-certs:/app/certs
+      # Uncomment to use a static config file instead of env vars
+      # - ./Evolord-Server/config.json:/app/config.json:ro
+    restart: unless-stopped
+    networks:
+      - evolord-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "-k", "https://localhost:5173/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  evolord-network:
+    driver: bridge
+
+volumes:
+  evolord-data:
+  evolord-certs:

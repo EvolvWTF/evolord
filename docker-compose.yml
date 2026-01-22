@@ -1,6 +1,6 @@
 services:
   evolord-server:
-    image: ${DOCKER_IMAGE:-ghcr.io/EvolvWTF/evolord:latest}
+    image: ${DOCKER_IMAGE:-ghcr.io/evolvwtf/evolord:latest}
     container_name: evolord-server
     ports:
       - "${PORT:-5173}:5173"

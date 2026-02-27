@@ -1,6 +1,8 @@
+version: "3.8"
+
 services:
   evolord-server:
-    image: ${DOCKER_IMAGE:-ghcr.io/pulsarv2/evolord:latest}
+    build: .
     container_name: evolord-server
     ports:
       - "${PORT:-5173}:5173"

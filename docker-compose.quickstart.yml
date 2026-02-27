@@ -1,6 +1,6 @@
 services:
   evolord-server: 
-    image: ghcr.io/evolvwtf/evolord:latest
+    image: ghcr.io/pulsarv2/evolord:latest
     container_name: evolord-server
     ports:
       - "5173:5173"
